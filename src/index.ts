@@ -11,22 +11,23 @@ const execFile = promisify(child_process.execFile);
 
 type File = {
   path: string;
+  inode: number;
   size: number;
 };
 
 async function main() {
   setLine(0, 'Listing files in current directory...');
   const { stdout } = await execFile('find', ['.', '-type', 'f']);
-  const files = stdout.split('\n').filter(Boolean);
-  setLine(0, `Listed ${files.length} files in current directory.`);
+  const filePaths = stdout.split('\n').filter(Boolean);
+  setLine(0, `Listed ${filePaths.length} files in current directory.`);
   reset();
 
-  const statFile = async (file: string): Promise<File> => {
-    const stats = await stat(file);
-    return { path: file, size: stats.size };
+  const statFile = async (path: string): Promise<File> => {
+    const { ino: inode, size } = await stat(path);
+    return { path, inode, size };
   };
 
-  const stats: File[] = [];
+  const files: File[] = [];
   let percent = 0;
 
   const printStatProgress = () => {
@@ -34,9 +35,9 @@ async function main() {
   };
   printStatProgress();
 
-  for await (const file of inParallel(statFile, 32, files)) {
-    stats.push(file);
-    const newPercent = Math.floor((100 * stats.length) / files.length);
+  for await (const file of inParallel(statFile, 32, filePaths)) {
+    files.push(file);
+    const newPercent = Math.floor((100 * files.length) / filePaths.length);
     if (newPercent > percent) {
       percent = newPercent;
       printStatProgress();
@@ -46,7 +47,7 @@ async function main() {
   setLine(0, 'Got file sizes.');
   reset();
 
-  const bySize = categorize(stats, ({ size }) => `${size}`);
+  const bySize = categorize(files, ({ size }) => `${size}`);
 
   let bytesRecoverable = 0;
 
@@ -57,14 +58,14 @@ async function main() {
     const size = +sizeStr;
 
     for (let i = 0; i < files.length - 1; i++) {
-      const a = files[i]!.path;
+      const a = files[i]!;
       for (let j = i + 1; j < files.length; j++) {
-        const b = files[j]!.path;
-        if (await equivalent(a, b)) {
-          console.log(`Found dup of ${a}: ${b}`);
+        const b = files[j]!;
+        if (a.inode !== b.inode && await equivalent(a.path, b.path)) {
+          console.log(`Found dup of ${a.path}: ${b.path}`);
           thunks.push(async () => {
-            await unlink(b);
-            await link(a, b);
+            await unlink(b.path);
+            await link(a.path, b.path);
           });
           bytesRecoverable += size;
         }
