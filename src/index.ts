@@ -68,6 +68,8 @@ async function main() {
             await link(a.path, b.path);
           });
           bytesRecoverable += size;
+          files.splice(j, 1);
+          j--;
         }
       }
     }
