@@ -1,0 +1,33 @@
+{
+  "name": "optimize-storage",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "files": [
+    "dist"
+  ],
+  "devDependencies": {
+    "@oxlint-tsgolint/linux-x64": "^7.0.2005",
+    "@types/node": "^26.6.6",
+    "oxfmt": "^0.76.0",
+    "oxlint": "^1.91.0",
+    "typescript": "^7.0.2"
+  },
+  "bin": {
+    "optimize-storage": "dist/index.js"
+  },
+  "dependencies": {
+    "promise-all-iterator": "^1.0.1",
+    "terminal-set-line": "^1.0.4"
+  },
+  "allowScripts": {
+    "get-cursor-position@2.0.0": true
+  }
+}
