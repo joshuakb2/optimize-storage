@@ -1,11 +1,12 @@
 import * as child_process from 'node:child_process';
 import { stat, link, unlink } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 
 import { setLine, reset } from 'terminal-set-line';
 
-import { inParallel } from './in_parallel.js';
+import { collect, inParallel } from './in_parallel.js';
 
 const execFile = promisify(child_process.execFile);
 
@@ -17,8 +18,7 @@ type File = {
 
 async function main() {
   setLine(0, 'Listing files in current directory...');
-  const { stdout } = await execFile('find', ['.', '-type', 'f']);
-  const filePaths = stdout.split('\n').filter(Boolean);
+  const filePaths = await collect(listFiles());
   setLine(0, `Listed ${filePaths.length} files in current directory.`);
   reset();
 
@@ -61,7 +61,7 @@ async function main() {
       const a = files[i]!;
       for (let j = i + 1; j < files.length; j++) {
         const b = files[j]!;
-        if (a.inode !== b.inode && await equivalent(a.path, b.path)) {
+        if (a.inode !== b.inode && (await equivalent(a.path, b.path))) {
           console.log(`Found dup of ${a.path}: ${b.path}`);
           thunks.push(async () => {
             await unlink(b.path);
@@ -106,6 +106,57 @@ async function main() {
   }
 
   console.log('Done');
+}
+
+function listFiles(): AsyncIterable<string> {
+  const p = child_process.spawn('find', ['.', '-type', 'f'], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const decoder = new StringDecoder('utf-8');
+  let text = '';
+  const queue: IteratorResult<string, undefined>[] = [];
+  let next: PromiseWithResolvers<IteratorResult<string, undefined>> | undefined;
+
+  const newPromise = () => {
+    next = Promise.withResolvers<IteratorResult<string, undefined>>();
+    return next.promise;
+  };
+
+  const kick = () => {
+    if (next) {
+      const result = queue.shift();
+      if (result) {
+        next.resolve(result);
+        next = undefined;
+      }
+    }
+  };
+
+  p.stdout.on('data', (data) => {
+    text += decoder.write(data);
+    const lines = text.split('\n');
+    queue.push(...lines.slice(0, -1).map((value) => ({ value })));
+    text = lines.at(-1)!;
+    kick();
+  });
+
+  p.stdout.on('end', () => {
+    text += decoder.end();
+    const lines = text.split('\n');
+    queue.push(...lines.filter(Boolean).map((value) => ({ value })));
+    queue.push({ done: true, value: undefined });
+    kick();
+  });
+
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next: () => {
+        const promise = newPromise();
+        kick();
+        return promise;
+      },
+    }),
+  };
 }
 
 async function equivalent(a: string, b: string) {
