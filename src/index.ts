@@ -1,14 +1,11 @@
 import * as child_process from 'node:child_process';
-import { stat, link, unlink } from 'node:fs/promises';
+import { stat, link, unlink, open } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { StringDecoder } from 'node:string_decoder';
-import { promisify } from 'node:util';
 
 import { setLine, reset } from 'terminal-set-line';
 
 import { collect, inParallel } from './in_parallel.js';
-
-const execFile = promisify(child_process.execFile);
 
 type File = {
   path: string;
@@ -27,6 +24,7 @@ async function main() {
     return { path, inode, size };
   };
 
+  const inodesSeen = new Set<number>();
   const files: File[] = [];
   let percent = 0;
 
@@ -36,7 +34,10 @@ async function main() {
   printStatProgress();
 
   for await (const file of inParallel(statFile, 32, filePaths)) {
-    files.push(file);
+    if (!inodesSeen.has(file.inode)) {
+      inodesSeen.add(file.inode);
+      files.push(file);
+    }
     const newPercent = Math.floor((100 * files.length) / filePaths.length);
     if (newPercent > percent) {
       percent = newPercent;
@@ -53,29 +54,148 @@ async function main() {
 
   const thunks: (() => Promise<void>)[] = [];
 
+  let line = 0;
+
   const optimize = async ([sizeStr, files]: [string, File[] | undefined]) => {
     if (!files || files.length < 2) return;
     const size = +sizeStr;
 
-    for (let i = 0; i < files.length - 1; i++) {
-      const a = files[i]!;
-      for (let j = i + 1; j < files.length; j++) {
-        const b = files[j]!;
-        if (a.inode !== b.inode && (await equivalent(a.path, b.path))) {
-          console.log(`Found dup of ${a.path}: ${b.path}`);
+    const myline = line++;
+    const fileCount = files.length;
+    let dups = 0;
+    let percent = 0;
+
+    const printStatus = () => {
+      setLine(myline, `Size = ${size} (${fileCount} files) (${dups} dups) (${percent}%)`);
+    };
+    printStatus();
+
+    type TreeNode = {
+      file: File;
+      height: number;
+      left?: TreeNode;
+      right?: TreeNode;
+    };
+
+    let tree: TreeNode = {
+      file: files[0]!,
+      height: 1,
+    };
+
+    const a = Buffer.alloc(1000);
+    const b = Buffer.alloc(1000);
+
+    const compareFiles = async (an: TreeNode, bn: TreeNode) => {
+      const af = await open(an.file.path, 'r');
+      const bf = await open(bn.file.path, 'r');
+
+      try {
+        while (true) {
+          const [{ bytesRead }] = await Promise.all([af.read(a), bf.read(b)]);
+          if (bytesRead === 0) return 'EQ';
+
+          const r = a.compare(b, 0, bytesRead, 0, bytesRead);
+          if (r < 0) return 'LT';
+          if (r > 0) return 'GT';
+        }
+      } finally {
+        af.close();
+        bf.close();
+      }
+    };
+
+    const placeNode = async (tree: TreeNode, newNode: TreeNode) => {
+      const result = await compareFiles(newNode, tree);
+
+      switch (result) {
+        case 'LT':
+          if (tree.left) {
+            await placeNode(tree.left, newNode);
+          } else {
+            tree.left = newNode;
+          }
+          return balance(tree);
+        case 'GT':
+          if (tree.right) {
+            await placeNode(tree.right, newNode);
+          } else {
+            tree.right = newNode;
+          }
+          return balance(tree);
+        case 'EQ':
           thunks.push(async () => {
-            await unlink(b.path);
-            await link(a.path, b.path);
+            await unlink(newNode.file.path);
+            await link(tree.file.path, newNode.file.path);
           });
           bytesRecoverable += size;
-          files.splice(j, 1);
-          j--;
+          dups++;
+          printStatus();
+          return tree;
+      }
+    };
+
+    const balance = async (tree: TreeNode) => {
+      const { left, right } = tree;
+      if (left && left.height - (right?.height ?? 0) > 1) {
+        left.right = await merge(tree, left.right);
+        left.height = 1 + Math.max(left.left?.height ?? 0, left.right?.height ?? 0);
+        return left;
+      }
+
+      if (right && right.height - (left?.height ?? 0) > 1) {
+        right.left = await merge(tree, right.left);
+        right.height = 1 + Math.max(right.left?.height ?? 0, right.right?.height ?? 0);
+        return right;
+      }
+
+      return tree;
+    };
+
+    const merge = async (a: TreeNode, b: TreeNode | undefined) => {
+      if (!b) return a;
+      if ((await compareFiles(a, b)) === 'LT') {
+        if ((a.right?.height ?? 0) < (b.left?.height ?? 0)) {
+          a.right = await merge(b, a.right);
+          a.height = 1 + Math.max(a.left?.height ?? 0, a.right?.height ?? 0);
+          return a;
+        } else {
+          b.left = await merge(a, b.left);
+          b.height = 1 + Math.max(b.left?.height ?? 0, b.right?.height ?? 0);
+          return b;
+        }
+      } else {
+        if ((a.left?.height ?? 0) < (b.right?.height ?? 0)) {
+          a.left = await merge(b, a.left);
+          a.height = 1 + Math.max(a.right?.height ?? 0, a.left?.height ?? 0);
+          return a;
+        } else {
+          b.right = await merge(a, b.right);
+          b.height = 1 + Math.max(b.right?.height ?? 0, b.left?.height ?? 0);
+          return b;
         }
       }
+    };
+
+    for (let i = 1; i < files.length; i++) {
+      const file = files[i]!;
+      const node: TreeNode = { file, height: 1 };
+      tree = await placeNode(tree, node);
+
+      const total = files.length - 1;
+      const done = i - 1;
+      const newPercent = Math.floor((100 * done) / total);
+      if (newPercent > percent) {
+        percent = newPercent;
+        printStatus();
+      }
     }
+
+    percent = 100;
+    printStatus();
   };
 
   console.log('Comparing files of the same size...');
+  reset();
   for await (const _ of inParallel(optimize, 8, Object.entries(bySize))) {
   }
 
@@ -157,15 +277,6 @@ function listFiles(): AsyncIterable<string> {
       },
     }),
   };
-}
-
-async function equivalent(a: string, b: string) {
-  try {
-    await execFile('diff', ['-q', a, b]);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function categorize<T, Keys extends string>(items: T[], getCategory: (x: T) => Keys) {
