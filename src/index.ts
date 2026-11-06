@@ -8,8 +8,9 @@ import { setLine, reset } from 'terminal-set-line';
 import { collect, inParallel } from './in_parallel.js';
 
 type File = {
-  path: string;
   inode: number;
+  path: string;
+  paths: string[];
   size: number;
 };
 
@@ -21,11 +22,10 @@ async function main() {
 
   const statFile = async (path: string): Promise<File> => {
     const { ino: inode, size } = await stat(path);
-    return { path, inode, size };
+    return { path, paths: [path], inode, size };
   };
 
-  const inodesSeen = new Set<number>();
-  const files: File[] = [];
+  const inodes = new Map<number, File>();
   let percent = 0;
 
   const printStatProgress = () => {
@@ -33,12 +33,16 @@ async function main() {
   };
   printStatProgress();
 
+  let i = 0;
   for await (const file of inParallel(statFile, 32, filePaths)) {
-    if (!inodesSeen.has(file.inode)) {
-      inodesSeen.add(file.inode);
-      files.push(file);
+    i++;
+    const existing = inodes.get(file.inode);
+    if (existing) {
+      existing.paths.push(file.path);
+    } else {
+      inodes.set(file.inode, file);
     }
-    const newPercent = Math.floor((100 * files.length) / filePaths.length);
+    const newPercent = Math.floor((100 * i) / filePaths.length);
     if (newPercent > percent) {
       percent = newPercent;
       printStatProgress();
@@ -48,7 +52,7 @@ async function main() {
   setLine(0, 'Got file sizes.');
   reset();
 
-  const bySize = categorize(files, ({ size }) => `${size}`);
+  const bySize = categorize(inodes.values(), ({ size }) => size);
 
   let bytesRecoverable = 0;
 
@@ -56,9 +60,8 @@ async function main() {
 
   let line = 0;
 
-  const optimize = async ([sizeStr, files]: [string, File[] | undefined]) => {
-    if (!files || files.length < 2) return;
-    const size = +sizeStr;
+  const optimize = async ([size, files]: [number, File[]]) => {
+    if (files.length < 2) return;
 
     const myline = line++;
     const fileCount = files.length;
@@ -124,8 +127,10 @@ async function main() {
           return balance(tree);
         case 'EQ':
           thunks.push(async () => {
-            await unlink(newNode.file.path);
-            await link(tree.file.path, newNode.file.path);
+            for (const path of newNode.file.paths) {
+              await unlink(path);
+              await link(tree.file.path, path);
+            }
           });
           bytesRecoverable += size;
           dups++;
@@ -182,7 +187,7 @@ async function main() {
       tree = await placeNode(tree, node);
 
       const total = files.length - 1;
-      const done = i - 1;
+      const done = i;
       const newPercent = Math.floor((100 * done) / total);
       if (newPercent > percent) {
         percent = newPercent;
@@ -196,7 +201,11 @@ async function main() {
 
   console.log('Comparing files of the same size...');
   reset();
-  for await (const _ of inParallel(optimize, 8, Object.entries(bySize))) {
+  for await (const _ of inParallel(
+    optimize,
+    8,
+    [...bySize.entries()].sort(([a], [b]) => a - b),
+  )) {
   }
 
   let recoverable = bytesRecoverable;
@@ -279,15 +288,16 @@ function listFiles(): AsyncIterable<string> {
   };
 }
 
-function categorize<T, Keys extends string>(items: T[], getCategory: (x: T) => Keys) {
-  const r: { [K in Keys]?: T[] } = {};
+function categorize<T, Keys>(items: Iterable<T>, getCategory: (x: T) => Keys) {
+  const r = new Map<Keys, T[]>();
 
   for (const item of items) {
     const category = getCategory(item);
-    if (r[category]) {
-      r[category].push(item);
+    let arr = r.get(category);
+    if (arr) {
+      arr.push(item);
     } else {
-      r[category] = [item];
+      r.set(category, [item]);
     }
   }
 
