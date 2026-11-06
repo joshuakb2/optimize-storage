@@ -61,10 +61,10 @@ async function main() {
 
   let bytesRecoverable = 0;
 
-  const thunks: (() => Promise<void>)[] = [];
+  const pruneThunks: (() => Promise<void>)[] = [];
   const statusPrinters: StatusPrinter[] = [];
 
-  const optimize = async ([size, files]: [number, File[]]) => {
+  const findDuplicates = async ([size, files]: [number, File[]]) => {
     if (files.length < 2) return;
 
     const fileCount = files.length;
@@ -136,7 +136,7 @@ async function main() {
           }
           return balance(tree);
         case 'EQ':
-          thunks.push(async () => {
+          pruneThunks.push(async () => {
             for (const path of newNode.file.paths) {
               await unlink(path);
               await link(tree.file.path, path);
@@ -240,7 +240,7 @@ async function main() {
   statusPrinters.push(overallStatus);
   overallStatus.print();
 
-  for await (const _ of inParallel(optimize, 8, groups)) {
+  for await (const _ of inParallel(findDuplicates, 8, groups)) {
     groupsCompleted++;
     overallStatus.print();
   }
@@ -267,7 +267,7 @@ async function main() {
 
   console.log('Recovering storage...');
 
-  for (const thunk of thunks) {
+  for (const thunk of pruneThunks) {
     await thunk();
   }
 
@@ -275,7 +275,7 @@ async function main() {
 }
 
 function listFiles(): AsyncIterable<string> {
-  const p = child_process.spawn('find', ['.', '-type', 'f'], {
+  const p = child_process.spawn('find', ['.', '-xdev', '-type', 'f'], {
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   const decoder = new StringDecoder('utf-8');
