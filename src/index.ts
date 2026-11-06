@@ -14,6 +14,11 @@ type File = {
   size: number;
 };
 
+type StatusPrinter = {
+  line: number;
+  print: () => void;
+};
+
 async function main() {
   setLine(0, 'Listing files in current directory...');
   const filePaths = await collect(listFiles());
@@ -57,21 +62,26 @@ async function main() {
   let bytesRecoverable = 0;
 
   const thunks: (() => Promise<void>)[] = [];
-
-  let line = 0;
+  const statusPrinters: StatusPrinter[] = [];
 
   const optimize = async ([size, files]: [number, File[]]) => {
     if (files.length < 2) return;
 
-    const myline = line++;
     const fileCount = files.length;
     let dups = 0;
     let percent = 0;
 
-    const printStatus = () => {
-      setLine(myline, `Size = ${size} (${fileCount} files) (${dups} dups) (${percent}%)`);
+    const status: StatusPrinter = {
+      line: overallStatus.line++,
+      print: () => {
+        setLine(status.line, `${size} bytes (${fileCount} files) (${dups} dups) (${percent}%)`);
+      },
     };
-    printStatus();
+
+    overallStatus.print();
+
+    statusPrinters.splice(-1, 0, status);
+    status.print();
 
     type TreeNode = {
       file: File;
@@ -134,7 +144,7 @@ async function main() {
           });
           bytesRecoverable += size;
           dups++;
-          printStatus();
+          status.print();
           return tree;
       }
     };
@@ -191,21 +201,48 @@ async function main() {
       const newPercent = Math.floor((100 * done) / total);
       if (newPercent > percent) {
         percent = newPercent;
-        printStatus();
+        status.print();
       }
     }
 
     percent = 100;
-    printStatus();
+
+    // Since we're done, move our status line above all the in-progress status lines.
+    const myIndex = statusPrinters.indexOf(status);
+
+    if (myIndex !== 0) {
+      status.line = statusPrinters[0]!.line;
+
+      for (let i = myIndex - 1; i >= 0; i--) {
+        statusPrinters[i]!.line++;
+        statusPrinters[i]!.print();
+      }
+    }
+
+    status.print();
+    statusPrinters.splice(myIndex, 1);
   };
 
   console.log('Comparing files of the same size...');
   reset();
-  for await (const _ of inParallel(
-    optimize,
-    8,
-    [...bySize.entries()].sort(([a], [b]) => a - b),
-  )) {
+
+  // oxlint-disable-next-line unicorn/no-useless-spread
+  const groups = [...bySize.entries().filter(([, files]) => files.length > 1)].sort(
+    ([a], [b]) => a - b,
+  );
+  let groupsCompleted = 0;
+
+  const overallStatus: StatusPrinter = {
+    line: 0,
+    print: () =>
+      setLine(overallStatus.line, `Groups completed: (${groupsCompleted}/${groups.length})`),
+  };
+  statusPrinters.push(overallStatus);
+  overallStatus.print();
+
+  for await (const _ of inParallel(optimize, 8, groups)) {
+    groupsCompleted++;
+    overallStatus.print();
   }
 
   let recoverable = bytesRecoverable;
