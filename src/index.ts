@@ -19,14 +19,19 @@ type StatusPrinter = {
   print: () => void;
 };
 
+type Direction = 'left' | 'right';
+
 async function main() {
   setLine(0, 'Listing files in current directory...');
   const filePaths = await collect(listFiles());
   setLine(0, `Listed ${filePaths.length} files in current directory.`);
   reset();
 
+  let blockSize!: number;
+
   const statFile = async (path: string): Promise<File> => {
-    const { ino: inode, size } = await stat(path);
+    const { ino: inode, size, blksize } = await stat(path);
+    blockSize = blksize;
     return { path, paths: [path], inode, size };
   };
 
@@ -86,8 +91,8 @@ async function main() {
     type TreeNode = {
       file: File;
       height: number;
-      left?: TreeNode;
-      right?: TreeNode;
+      left?: TreeNode | undefined;
+      right?: TreeNode | undefined;
     };
 
     let tree: TreeNode = {
@@ -95,8 +100,8 @@ async function main() {
       height: 1,
     };
 
-    const a = Buffer.alloc(1000);
-    const b = Buffer.alloc(1000);
+    const a = Buffer.alloc(blockSize);
+    const b = Buffer.alloc(blockSize);
 
     const compareFiles = async (an: TreeNode, bn: TreeNode) => {
       const af = await open(an.file.path, 'r');
@@ -117,84 +122,74 @@ async function main() {
       }
     };
 
-    const placeNode = async (tree: TreeNode, newNode: TreeNode) => {
-      const result = await compareFiles(newNode, tree);
+    const insert = async (node: TreeNode, newNode: TreeNode): Promise<TreeNode> => {
+      const result = await compareFiles(newNode, node);
 
       switch (result) {
         case 'LT':
-          if (tree.left) {
-            await placeNode(tree.left, newNode);
+          if (node.left) {
+            node.left = await insert(node.left, newNode);
+            if (getBalance(node) > 1) {
+              if (getBalance(node.left) < 0) {
+                node.left = rotate(node.left, node.left.right!, 'right', 'left');
+              }
+              return rotate(node, node.left, 'left', 'right');
+            }
           } else {
-            tree.left = newNode;
+            node.left = newNode;
           }
-          return balance(tree);
+          updateHeight(node);
+          return node;
+
         case 'GT':
-          if (tree.right) {
-            await placeNode(tree.right, newNode);
+          if (node.right) {
+            node.right = await insert(node.right, newNode);
+            if (getBalance(node) < -1) {
+              if (getBalance(node.right) > 0) {
+                node.right = rotate(node.right, node.right.left!, 'left', 'right');
+              }
+              return rotate(node, node.right, 'right', 'left');
+            }
           } else {
-            tree.right = newNode;
+            node.right = newNode;
           }
-          return balance(tree);
+          updateHeight(node);
+          return node;
+
         case 'EQ':
           pruneThunks.push(async () => {
             for (const path of newNode.file.paths) {
               await unlink(path);
-              await link(tree.file.path, path);
+              await link(node.file.path, path);
             }
           });
           bytesRecoverable += size;
           dups++;
           status.print();
-          return tree;
+          return node;
       }
     };
 
-    const balance = async (tree: TreeNode) => {
-      const { left, right } = tree;
-      if (left && left.height - (right?.height ?? 0) > 1) {
-        left.right = await merge(tree, left.right);
-        left.height = 1 + Math.max(left.left?.height ?? 0, left.right?.height ?? 0);
-        return left;
-      }
+    const rotate = (root: TreeNode, newRoot: TreeNode, heavy: Direction, light: Direction) => {
+      root[heavy] = newRoot[light];
+      newRoot[light] = root;
 
-      if (right && right.height - (left?.height ?? 0) > 1) {
-        right.left = await merge(tree, right.left);
-        right.height = 1 + Math.max(right.left?.height ?? 0, right.right?.height ?? 0);
-        return right;
-      }
+      updateHeight(root);
+      updateHeight(newRoot);
 
-      return tree;
+      return newRoot;
     };
 
-    const merge = async (a: TreeNode, b: TreeNode | undefined) => {
-      if (!b) return a;
-      if ((await compareFiles(a, b)) === 'LT') {
-        if ((a.right?.height ?? 0) < (b.left?.height ?? 0)) {
-          a.right = await merge(b, a.right);
-          a.height = 1 + Math.max(a.left?.height ?? 0, a.right?.height ?? 0);
-          return a;
-        } else {
-          b.left = await merge(a, b.left);
-          b.height = 1 + Math.max(b.left?.height ?? 0, b.right?.height ?? 0);
-          return b;
-        }
-      } else {
-        if ((a.left?.height ?? 0) < (b.right?.height ?? 0)) {
-          a.left = await merge(b, a.left);
-          a.height = 1 + Math.max(a.right?.height ?? 0, a.left?.height ?? 0);
-          return a;
-        } else {
-          b.right = await merge(a, b.right);
-          b.height = 1 + Math.max(b.right?.height ?? 0, b.left?.height ?? 0);
-          return b;
-        }
-      }
+    const updateHeight = (tree: TreeNode) => {
+      tree.height = 1 + Math.max(tree.left?.height ?? 0, tree.right?.height ?? 0);
     };
+
+    const getBalance = (node: TreeNode) => (node.left?.height ?? 0) - (node.right?.height ?? 0);
 
     for (let i = 1; i < files.length; i++) {
       const file = files[i]!;
       const node: TreeNode = { file, height: 1 };
-      tree = await placeNode(tree, node);
+      tree = await insert(tree, node);
 
       const total = files.length - 1;
       const done = i;
